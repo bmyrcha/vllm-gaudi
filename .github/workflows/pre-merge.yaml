@@ -1,9 +1,15 @@
-name: Basic HPU test suite 
+name: Basic HPU test suite
+
+run-name: "PR #${{ inputs.pr_number }} [${{ inputs.head_sha }}]"
 
 on:
-  # Allow manual triggering for testing purposes
-  workflow_dispatch: {}
-  workflow_call: {}
+  workflow_dispatch:
+    inputs:
+      pr_number:  { description: 'PR number',                     required: false, type: string }
+      head_sha:   { description: 'PR head commit SHA',            required: false, type: string }
+      base_ref:   { description: 'PR target branch',              required: false, type: string }
+      is_draft:   { description: 'Draft PR (true/false)',         required: false, type: string, default: 'false' }
+      skip_tests: { description: 'Skip Gaudi tests (true/false)', required: false, type: string, default: 'false' }
 
 permissions:
   pull-requests: write
@@ -11,7 +17,7 @@ permissions:
   checks: read
 
 concurrency: 
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.pr_number || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,7 +38,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           clean: true # Ensure a clean workspace before checkout
           fetch-depth: 0
 
@@ -47,8 +53,8 @@ jobs:
           # --- New check to see if the PR is behind the base branch ---
           echo "Checking if the PR is behind the base branch..."
           # Fetch just the latest commit from the base branch for comparison
-          git fetch origin ${{ github.event.pull_request.base.ref }} --depth=1
-          behind_count=$(git rev-list --count HEAD..origin/${{ github.event.pull_request.base.ref }})
+          git fetch origin ${{ inputs.base_ref || github.event.pull_request.base.ref }} --depth=1
+          behind_count=$(git rev-list --count HEAD..origin/${{ inputs.base_ref || github.event.pull_request.base.ref }})
           
           if_pr_is_behind="false"
           if [[ $behind_count -gt 0 ]]; then
@@ -60,7 +66,8 @@ jobs:
           # --- End of new check ---
 
 
-          if [[ "${{ github.event.pull_request.draft }}" == "true" ]]; then
+          PR_DRAFT="${{ inputs.is_draft || github.event.pull_request.draft }}"
+          if [[ "$PR_DRAFT" == "true" ]]; then
             BLOCKING_REASON="This is a **Draft PR**. Please mark it as 'Ready for Review' to trigger the CI."
 
           # Use the 'gh' CLI to fetch the LIVE mergeable state after the sleep
@@ -88,7 +95,7 @@ jobs:
         if: steps.check_conditions.outputs.run_ci == 'false'
         uses: peter-evans/create-or-update-comment@v4
         with:
-          issue-number: ${{ github.event.pull_request.number }}
+          issue-number: ${{ inputs.pr_number || github.event.pull_request.number }}
           body: |
             ### 🚧 CI Blocked
 
@@ -116,7 +123,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           clean: true # Ensure a clean workspace before checkout
       - name: Discover test functions
         id: set-matrix
@@ -145,7 +152,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           clean: true # Ensure a clean workspace before checkout
 
       - name: Setup Python
@@ -165,7 +172,8 @@ jobs:
 
   pre_merge_hpu_test_build:
     if: >
-        !contains(github.event.pull_request.labels.*.name, 'skip-gaudi-tests')
+        !contains(github.event.pull_request.labels.*.name, 'skip-gaudi-tests') &&
+        inputs.skip_tests != 'true'
     needs: [pre-commit, discover_tests]
     # --- UPDATED: Run on the specific node ---
     runs-on: self-hosted
@@ -176,14 +184,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           # Fetch full history for accurate commit comparison
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           clean: true # Ensure a clean workspace before checkout
   
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           # Fetch full history for accurate commit comparison
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           clean: true # Ensure a clean workspace before checkout
 
       - name: Setup Docker environment and build image
@@ -248,7 +256,7 @@ jobs:
       - name: Run test suite - ${{ matrix.test_function }}
         run: |
           EXITCODE=1
-          CONTAINER_NAME="hpu-plugin-test-e2e-${{ github.event.pull_request.head.sha }}-${{ matrix.test_function }}"
+          CONTAINER_NAME="hpu-plugin-test-e2e-${{ inputs.head_sha || github.event.pull_request.head.sha }}-${{ matrix.test_function }}"
           echo "Container: ${CONTAINER_NAME}"
 
           echo "Running HPU plugin test: ${{ matrix.test_function }}"
@@ -277,7 +285,7 @@ jobs:
         if: needs.pre_merge_hpu_test.result == 'success'
         uses: peter-evans/create-or-update-comment@v4
         with:
-          issue-number: ${{ github.event.pull_request.number }}
+          issue-number: ${{ inputs.pr_number || github.event.pull_request.number }}
           body: |
             ### ✅ CI Passed
             All checks passed successfully
