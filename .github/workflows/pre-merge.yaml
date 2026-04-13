@@ -216,11 +216,13 @@ jobs:
       - name: Set PR info from dispatch inputs
         id: set_info
         run: |
-          echo "pr_number=${{ inputs.pr_number }}" >> "$GITHUB_OUTPUT"
-          echo "pr_title=${{ inputs.pr_title }}" >> "$GITHUB_OUTPUT"
-          echo "pr_labels=" >> "$GITHUB_OUTPUT"
-          echo "pr_base_ref=${{ inputs.base_ref }}" >> "$GITHUB_OUTPUT"
-          echo "skip_gaudi_tests=${{ inputs.skip_tests }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "pr_number=${{ inputs.pr_number }}"
+            echo "pr_title=${{ inputs.pr_title }}"
+            echo "pr_labels="
+            echo "pr_base_ref=${{ inputs.base_ref }}"
+            echo "skip_gaudi_tests=${{ inputs.skip_tests }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Display PR information
         run: |
@@ -525,7 +527,18 @@ jobs:
         if: inputs.is_merge_group != 'true' && needs.pre_merge_hpu_test.result == 'success'
         uses: peter-evans/create-or-update-comment@v4
         with:
-          issue-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          issue-number: ${{ inputs.pr_number }}
           body: |
             ### ✅ CI Passed
             All checks passed successfully
+
+  cleanup_docker_image:
+    name: Cleanup Docker Image
+    if: always()
+    needs: [discover_runner, hpu_unit_tests, hpu_pd_tests, hpu_perf_tests, hpu_dp_tests, e2e, calibration_tests, calibration_arg_parsing_tests]
+    runs-on: ${{ needs.discover_runner.outputs.runner_name }}
+    steps:
+      - name: Remove Docker image to free up space
+        run: |
+          echo "Cleaning up Docker images created by this workflow run..."
+          docker rmi -f hpu-plugin-v1-test-env-pre-merge-${{ inputs.head_sha }} || true
