@@ -28,8 +28,9 @@ This document summarizes the features currently supported by the vLLM Hardware P
 | Multiprocessing backend   | The default distributed runtime in vLLM.   | [Documentation](https://docs.vllm.ai/en/v0.10.0/serving/distributed_serving.html)  |
 | Multimodal   | Supports inference for multi-modal models. It is not fully supported with the `t.compile` execution mode. |  [Documentation](https://docs.vllm.ai/en/latest/features/multimodal_inputs.html) |
 | Guided decode   | Supports a guided decoding backend for generating structured outputs.   | [Documentation](https://docs.vllm.ai/en/latest/features/structured_outputs.html)  |
-| Exponential bucketing | Supports exponential bucketing spacing instead of linear spacing, automating the configuration of the bucketing mechanism. This feature is enabled by default and can be disabled via `VLLM_EXPONENTIAL_BUCKETING=false` environment variable.   | N/A |
+| Configurable bucketing strategies | Supports exponential (`exp`), linear (`lin`), and padding-aware (`pad`) bucketing strategies, selected with `VLLM_BUCKETING_STRATEGY`. The default is `exp`.   | [Bucketing Mechanism](bucketing_mechanism.md) |
 | Data Parallel support | Replicates model weights across multiple instances or GPUs to process independent request batches. | [Documentation](https://docs.vllm.ai/en/stable/serving/data_parallel_deployment.html), [Example](https://docs.vllm.ai/en/latest/examples/offline_inference/data_parallel.html)  |
+| Row-Parallel Chunking | Overlaps computation with communication in RowParallelLinear layers by splitting input into chunks and launching async all-reduce operations. Improves throughput for tensor-parallel inference with long prefills. Configured via `VLLM_ROW_PARALLEL_CHUNKS` and `VLLM_ROW_PARALLEL_CHUNK_THRESHOLD` environment variables. | [Documentation](row_parallel_chunking.md) |
 
 ## Experimental Features
 
@@ -41,7 +42,7 @@ compilations triggered by varying constant scale values in quantized model layer
 You can reduce the FP8 warm-up time by setting the `RUNTIME_SCALE_PATCHING=1` environment variable and
 selecting a hardware-aligned per-tensor `scale_method` provided by the `INC JSON config <json-options>`.
 This feature is recommended for larger models, such as 70B and 405B. When combined with
-`VLLM_EXPONENTIAL_BUCKETING` for FP8 models, it can reduce warm-up time by up to 90%.
+`VLLM_BUCKETING_STRATEGY=exp` for FP8 models, it can reduce warm-up time by up to 90%.
 
 !!!note
     This feature reduces FP8 warm-up time but may lower model throughput by 5-20%. Future releases will improve performance and extend support to more options. Currently, the feature is supported with Lazy mode (`PT_HPU_LAZY_MODE=1`) and `torch.compile`. It supports Llama workloads using FP8 execution of Linear and FSDPA layers, and casting ops between BF16 and FP8. MoE and Convolution options are not yet supported.
@@ -56,6 +57,25 @@ The following values are supported:
 - `1`: Removes scales equal to 1.0 in `cast_to_fp8_v2` and `cast_from_fp8`, disabling the corresponding `mult_fwd` (multiplication) node.
 - `2`: Applies the same optimization as mode `1`, and additionally removes reciprocal scales in `fp8_gemm_v2`.
 
+### Dynamic Quantization for MatMul and KV‑cache Operations
+
+This feature applies dynamic quantization to MatMul operations and KV-cache storage, improving performance with minimal expected impact on accuracy.
+
+To enable the feature:
+
+1. Set the environment variable:
+
+   ```
+   export VLLM_DYNAMIC_KV_QUANT=1
+   ```
+
+2. Update your quantization configuration file with the following options:
+
+   ```
+   "dynamicquantization": "True",
+   "scaleformat": "CONST"
+   ```
+
 ## Planned Features
 
 Future plugin releases are planned to provide support for the following vLLM features:
@@ -63,7 +83,6 @@ Future plugin releases are planned to provide support for the following vLLM fea
 - Sliding window attention
 - P/D disaggregate support
 - In-place weight update
-- MLA with unified attention
 - Multinode support
 - Pipeline parallel inference
 

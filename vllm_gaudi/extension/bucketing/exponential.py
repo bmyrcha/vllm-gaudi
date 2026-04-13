@@ -9,6 +9,8 @@ from typing import List, Set, Tuple
 from vllm_gaudi.extension.logger import logger as logger
 from vllm_gaudi.extension.runtime import get_config
 
+LONG_CTX_THRESHOLD = 8192
+
 
 class ExponentialBucketingStrategy():
     long_context: bool = False
@@ -39,15 +41,18 @@ class ExponentialBucketingStrategy():
         else:
             query_min = block_size
         use_merged_prefill = get_config().merged_prefill
-        self.long_context = max_model_len >= 8192
+        self.long_context = max_model_len >= LONG_CTX_THRESHOLD
 
         # cfgs shape: [min, step, max, limit]
         prompt_bs_limit = math.ceil(math.log2(max_num_prefill_seqs)) + 1
         prompt_bs_bucket_cfg = [1, 2, max_num_prefill_seqs, prompt_bs_limit]
         max_prompt_seq_limit = math.ceil(math.log2(max_num_batched_tokens))
         prompt_query_bucket_cfg = [query_min, block_size, max_num_batched_tokens, max_prompt_seq_limit]
-        # Max ctx for all queries; later we generate additional buckets for max ctx per query
-        max_ctx = max(1, math.ceil((max_model_len - max_num_batched_tokens) // block_size))
+        if self.long_context:
+            # Max ctx for all queries; later we generate additional buckets for max ctx per query
+            max_ctx = max(1, math.ceil((max_model_len - max_num_batched_tokens) // block_size))
+        else:
+            max_ctx = max(1, math.ceil((max_model_len - prompt_query_bucket_cfg[0]) // block_size))
         max_prompt_ctx_limit = 2 if max_ctx == 1 else math.ceil(math.log2(max_ctx)) + 1
         prompt_ctx_bucket_cfg = [0, 1, max_ctx, max_prompt_ctx_limit]
 
@@ -78,16 +83,27 @@ class ExponentialBucketingStrategy():
 
     def get_decode_cfgs(self, max_num_seqs, block_size, max_num_batched_tokens, max_model_len, max_blocks):
         self.check_for_user_flags('decode')
-        prefix_caching = get_config().prefix_caching
         use_contiguous_pa = get_config().use_contiguous_pa
 
         # cfgs shape: [min, step, max, limit]
         decode_bs_limit = math.ceil(math.log2(max_num_seqs)) + 1
         decode_bs_bucket_cfg = [1, 2, max_num_seqs, decode_bs_limit]
         decode_query_bucket_cfg = [1, 1, 1, 1]
-        max_decode_block_limit = math.ceil(math.log2(max_blocks)) + 1
+        # Cap block limit to avoid excessive decode warmup buckets.
+        # Without the cap, large KV caches (e.g. 131K context) produce
+        # 17-18 block buckets which, combined with batch-size buckets,
+        # yields 100+ decode graphs and 30+ min warmup time.
+        # The cap scales with batch-size buckets to keep the total
+        # Cartesian product manageable while preserving coverage.
+        decode_block_limit_cap = max(6, decode_bs_limit)
+        # With non-contiguous PA, total block references across all sequences
+        # can exceed physical num_hpu_blocks (same physical block appears in
+        # multiple sequence block tables).  Use 3x headroom so prepared buckets
+        # cover realistic prefix-sharing scenarios and avoid costly HPU graph
+        # recompilation at high KV-cache utilization.
         max_decode_blocks = max_blocks if use_contiguous_pa else \
-                            min((max_model_len // block_size * max_num_seqs), max_blocks)
+                            max_blocks * 3
+        max_decode_block_limit = min(math.ceil(math.log2(max_decode_blocks)) + 1, decode_block_limit_cap)
         decode_block_bucket_cfg = [1, max_num_seqs, max_decode_blocks, max_decode_block_limit]
 
         msg = ("Decode bucket config (min, step, max_warmup, limit) "
@@ -140,13 +156,8 @@ def warmup_range_with_limit(config: Tuple[int, int, int, int], long_context=Fals
         bmin = bstep
     assert num_buckets > 0, "num_buckets must be a positive integer"
 
-    if long_context:
-        num_buckets_exp = math.floor(num_buckets / 2)
-        num_buckets_linear = num_buckets - num_buckets_exp
-        first_step = bmax / num_buckets  #or i.e. * 0.25
-    else:
-        num_buckets_exp = num_buckets
-        first_step = bmax
+    num_buckets_exp = num_buckets
+    first_step = bmax
 
     if num_buckets_exp <= 1:
         return [bmax]
@@ -161,19 +172,6 @@ def warmup_range_with_limit(config: Tuple[int, int, int, int], long_context=Fals
             bucket = math.ceil(power_unpadded / bstep) * bstep
         buckets.add(bucket)
 
-    if long_context:
-        #tmp_step = bmax / num_buckets
-        tmp_step = (bmax - first_step) / num_buckets_linear
-        for i in range(1, num_buckets_linear + 1):
-            #for i in range(1, num_buckets+1):
-            power_unpadded = first_step + i * tmp_step
-
-            if i == num_buckets and get_config().use_contiguous_pa:
-                bucket = bmax
-            else:
-                bucket = math.ceil(power_unpadded / bstep) * bstep
-            if bucket not in buckets:
-                buckets.add(bucket)
     if add_zero_or_one_bucket:
         buckets.add(bmin_origin)
     sorted_buckets = list(sorted(buckets))

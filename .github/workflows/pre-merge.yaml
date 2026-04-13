@@ -8,21 +8,34 @@ on:
       pr_number:  { description: 'PR number',                     required: false, type: string }
       head_sha:   { description: 'PR head commit SHA',            required: false, type: string }
       base_ref:   { description: 'PR target branch',              required: false, type: string }
+      pr_title:   { description: 'PR title',                      required: false, type: string }
       is_draft:   { description: 'Draft PR (true/false)',         required: false, type: string, default: 'false' }
-      skip_tests: { description: 'Skip Gaudi tests (true/false)', required: false, type: string, default: 'false' }
+      skip_tests:     { description: 'Skip Gaudi tests (true/false)',    required: false, type: string, default: 'false' }
+      is_merge_group: { description: 'Triggered from merge queue (true/false)', required: false, type: string, default: 'false' }
 
 permissions:
   pull-requests: write
   # This line allows it to read the status of checks like DCO
   checks: read
 
-concurrency: 
+concurrency:
   group: ${{ github.workflow }}-${{ inputs.pr_number || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  retrieve_head_sha:
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.set_sha.outputs.head_sha }}
+    steps:
+      - name: Set Head SHA Output
+        id: set_sha
+        run: |
+          echo "head_sha=${{ inputs.head_sha || github.event.pull_request.head.sha || github.event.merge_group.head_sha }}" >> "$GITHUB_OUTPUT"
+
   gatekeeper:
-    runs-on: self-hosted
+    needs: retrieve_head_sha
+    runs-on: ubuntu-latest
     permissions:
       # Required to read the status of checks and PR details
       checks: read
@@ -38,7 +51,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
           clean: true # Ensure a clean workspace before checkout
           fetch-depth: 0
 
@@ -48,6 +61,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [[ "${{ inputs.is_merge_group }}" == "true" ]]; then
+            echo "Merge group event detected. Skipping gatekeeper checks."
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           BLOCKING_REASON=""
 
           # --- New check to see if the PR is behind the base branch ---
@@ -55,7 +74,7 @@ jobs:
           # Fetch just the latest commit from the base branch for comparison
           git fetch origin ${{ inputs.base_ref || github.event.pull_request.base.ref }} --depth=1
           behind_count=$(git rev-list --count HEAD..origin/${{ inputs.base_ref || github.event.pull_request.base.ref }})
-          
+
           if_pr_is_behind="false"
           if [[ $behind_count -gt 0 ]]; then
             echo "PR is behind by ${behind_count} commit(s)."
@@ -91,11 +110,10 @@ jobs:
       - name: Post comment if CI is blocked
         # This ensures that even if commenting fails, the next step will run
         continue-on-error: true
-        # Only run this step if the check failed
         if: steps.check_conditions.outputs.run_ci == 'false'
         uses: peter-evans/create-or-update-comment@v4
         with:
-          issue-number: ${{ inputs.pr_number || github.event.pull_request.number }}
+          issue-number: ${{ inputs.pr_number }}
           body: |
             ### 🚧 CI Blocked
 
@@ -103,7 +121,7 @@ jobs:
             > ${{ steps.check_conditions.outputs.reason }}
 
       - name: Fail the job to block downstream CI
-        if: steps.check_conditions.outputs.run_ci == 'false'
+        if: inputs.is_merge_group != 'true' && steps.check_conditions.outputs.run_ci == 'false'
         run: |
           echo "Failing this job to prevent the main CI from running."
           exit 1
@@ -111,9 +129,24 @@ jobs:
   # --- NEW JOB ---
   # This job runs first on the self-hosted pool, picks a runner,
   # and outputs its name so all other jobs can target it.
+  # If PR title contains [FIX_FOR_VLLM_LATEST], it uses the hourly-ci runner pool.
+  discover_runner:
+    needs: gatekeeper
+    runs-on: ${{ contains(inputs.pr_title || github.event.pull_request.title, '[FIX_FOR_VLLM_LATEST]') && 'hourly-ci' || 'pr-ci' }}
+    outputs:
+      runner_name: ${{ steps.get_name.outputs.name }}
+    steps:
+      - name: Get runner name
+        id: get_name
+        run: |
+          echo "This workflow will run on: ${{ runner.name }}"
+          echo "name=${{ runner.name }}" >> "$GITHUB_OUTPUT"
 
   discover_tests:
-    runs-on: self-hosted
+    # --- UPDATED: Add discover_runner dependency ---
+    needs: [discover_runner, retrieve_head_sha]
+    # --- UPDATED: Run on the specific node ---
+    runs-on: ${{ needs.discover_runner.outputs.runner_name }}
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -123,7 +156,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
           clean: true # Ensure a clean workspace before checkout
       - name: Discover test functions
         id: set-matrix
@@ -131,7 +164,7 @@ jobs:
           # This command robustly discovers all functions in the script that match the 'run_*'
           # naming convention, excluding the main 'run_all_tests' function itself.
           # The final list is formatted into a JSON array required for the matrix strategy.
-          TEST_FUNCTIONS=$( grep '^run_' ./tests/full_tests/ci_gsm8k_tests.sh | \
+          TEST_FUNCTIONS=$( grep '^run_' ./tests/full_tests/ci_e2e_discoverable_tests.sh | \
                       awk '{print $1}' | \
                       sed 's/()//' | \
                       jq -R . | jq -s -c . )
@@ -144,15 +177,67 @@ jobs:
           fi
           echo "matrix=$TEST_FUNCTIONS" >> "$GITHUB_OUTPUT"
 
-  pre-commit:
-    # This job runs in parallel with the build job
-    needs: gatekeeper
-    runs-on: self-hosted
+  discover_calibration_tests:
+    needs: [discover_runner, retrieve_head_sha]
+    runs-on: ${{ needs.discover_runner.outputs.runner_name }}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
+          clean: true
+      - name: Discover calibration test functions
+        id: set-matrix
+        run: |
+          TEST_FUNCTIONS=$( grep '^run_' ./tests/calibration_tests/ci_calibration_smoke_tests.sh | \
+                      awk '{print $1}' | \
+                      sed 's/()//' | \
+                      jq -R . | jq -s -c . )
+
+          echo "Discovered calibration test matrix: $TEST_FUNCTIONS"
+          if [ "$TEST_FUNCTIONS" = "[]" ]; then
+            echo "::error::No calibration test functions were discovered. Failing the workflow."
+            exit 1
+          fi
+          echo "matrix=$TEST_FUNCTIONS" >> "$GITHUB_OUTPUT"
+
+  retrieve_pr_info:
+    needs: [gatekeeper, retrieve_head_sha]
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.set_info.outputs.pr_number }}
+      pr_title: ${{ steps.set_info.outputs.pr_title }}
+      pr_labels: ${{ steps.set_info.outputs.pr_labels }}
+      pr_base_ref: ${{ steps.set_info.outputs.pr_base_ref }}
+      skip_gaudi_tests: ${{ steps.set_info.outputs.skip_gaudi_tests }}
+    steps:
+      - name: Set PR info from dispatch inputs
+        id: set_info
+        run: |
+          echo "pr_number=${{ inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+          echo "pr_title=${{ inputs.pr_title }}" >> "$GITHUB_OUTPUT"
+          echo "pr_labels=" >> "$GITHUB_OUTPUT"
+          echo "pr_base_ref=${{ inputs.base_ref }}" >> "$GITHUB_OUTPUT"
+          echo "skip_gaudi_tests=${{ inputs.skip_tests }}" >> "$GITHUB_OUTPUT"
+
+      - name: Display PR information
+        run: |
+          echo "PR Number: ${{ inputs.pr_number }}"
+          echo "PR Title: ${{ inputs.pr_title }}"
+          echo "PR Base Ref: ${{ inputs.base_ref }}"
+          echo "Skip Gaudi Tests: ${{ inputs.skip_tests }}"
+
+  pre-commit:
+    # This job runs in parallel with the build job
+    needs: [gatekeeper, retrieve_head_sha]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
           clean: true # Ensure a clean workspace before checkout
 
       - name: Setup Python
@@ -171,10 +256,9 @@ jobs:
           extra_args: --all-files --hook-stage manual
 
   pre_merge_hpu_test_build:
-    if: >
-        !contains(github.event.pull_request.labels.*.name, 'skip-gaudi-tests') &&
-        inputs.skip_tests != 'true'
-    needs: [pre-commit, discover_tests]
+    # --- UPDATED: Add discover_runner dependency ---
+    needs: [pre-commit, discover_tests, discover_calibration_tests, discover_runner, retrieve_pr_info, retrieve_head_sha]
+    if: needs.retrieve_pr_info.outputs.skip_gaudi_tests != 'true'
     # --- UPDATED: Run on the specific node ---
     runs-on: self-hosted
     permissions:
@@ -184,19 +268,103 @@ jobs:
         uses: actions/checkout@v4
         with:
           # Fetch full history for accurate commit comparison
-          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
           clean: true # Ensure a clean workspace before checkout
-  
+      - name: Read Stable Commit from Target Branch
+        id: read_stable_commit
+        run: |
+          TARGET_FILE="VLLM_STABLE_COMMIT"
+          COMMIT_HASH=""
+
+          # 1. Primary Check: Look in the current branch
+          echo "INFO: Checking for '$TARGET_FILE' in the current branch..."
+          if [ -f "$TARGET_FILE" ]; then
+            COMMIT_HASH=$(tr -d '[:space:]' < "$TARGET_FILE")
+            if [ -n "$COMMIT_HASH" ]; then
+              echo "✅ Found stable commit in current branch: $COMMIT_HASH"
+            else
+              echo "::warning:: File '$TARGET_FILE' is empty in current branch. Proceeding to fallback."
+            fi
+          else
+            echo "INFO: File not found in current branch. Proceeding to fallback."
+          fi
+
+          # 2. Fallback Check: Look in the remote branch if the first check failed
+          if [ -z "$COMMIT_HASH" ]; then
+            TARGET_BRANCH="vllm/last-good-commit-for-vllm-gaudi"
+            echo "➡️ Fallback: Attempting to read '$TARGET_FILE' from branch '$TARGET_BRANCH'..."
+
+            git fetch origin "$TARGET_BRANCH" --no-tags --depth=1 || true
+
+            # Read file from the remote branch; suppress errors if not found
+            COMMIT_HASH=$(git show "origin/$TARGET_BRANCH:$TARGET_FILE" 2>/dev/null) || COMMIT_HASH=""
+            COMMIT_HASH=$(echo "$COMMIT_HASH" | tr -d '[:space:]')
+
+            if [ -n "$COMMIT_HASH" ]; then
+              echo "✅ Found stable commit in fallback branch: $COMMIT_HASH"
+            else
+              echo "::error:: Fallback failed. Could not find a valid commit hash in either location."
+            fi
+          fi
+
+          # 3. Export the final result
+          echo "VLLM_STABLE_COMMIT=$COMMIT_HASH" >> "$GITHUB_ENV"
+      - name: Determine Target Commit Based on PR Title
+        id: determine_commit
+        env:
+          PR_TITLE_ENV: ${{ needs.retrieve_pr_info.outputs.pr_title }}
+        run: |
+          # Default to the stable commit from the previous step
+          FINAL_TARGET="${VLLM_STABLE_COMMIT}"
+          # ⬇️ 2. Read the title from the safe environment variable
+          PR_TITLE="$PR_TITLE_ENV"
+
+          echo "Pull Request Title: \"${PR_TITLE}\""
+
+          # Check if the title contains the special flag
+          if [[ "$PR_TITLE" == *"[FIX_FOR_VLLM_LATEST]"* ]]; then
+            echo "✅ Flag '[FIX_FOR_VLLM_LATEST]' found in title."
+            echo "Setting target to 'main'."
+            FINAL_TARGET="vllm-upstream/main"
+          elif [[ "$PR_TITLE" == *"[FIX_FOR_VLLM_CUSTOM"* ]]; then
+            echo "[FIX_FOR_VLLM_CUSTOM]' found in title."
+            PRE_FINAL_TARGET=$(echo "$PR_TITLE" | cut -d '=' -f 2)
+            echo "Setting target to ${PRE_FINAL_TARGET}"
+            FINAL_TARGET=$(echo "$PRE_FINAL_TARGET" | cut -d ']' -f 1)
+            echo "Setting target to ${FINAL_TARGET}"
+          elif [ -z "$FINAL_TARGET" ]; then
+            # This is the corrected check for a missing commit hash
+            echo "⚠️ Stable commit was not found. Defaulting target to 'main'."
+            FINAL_TARGET="vllm-upstream/main"
+          else
+            echo "Using stable commit: ${FINAL_TARGET}"
+          fi
+
+          # Export the result to an environment variable for subsequent steps
+          echo "TARGET_COMMIT=${FINAL_TARGET}" >> "$GITHUB_ENV"
+          echo "commit_ref=${FINAL_TARGET}" >> "$GITHUB_OUTPUT"
+      - name: Add vLLM upstream as a remote and checkout target commit
+        id: checkout_vllm_upstream
+        run: |
+          echo "Attempting to remove remote branch if it exists..."
+          git remote remove vllm-upstream || true
+          echo "add vllm-upstream remote..."
+          git remote add vllm-upstream https://github.com/vllm-project/vllm.git
+          echo "Checking out code from '${{ env.TARGET_COMMIT }}'..."
+          git fetch vllm-upstream --depth=100
+          git checkout "${{ env.TARGET_COMMIT }}"
+          COMMIT_ID=$(git rev-parse HEAD)
+          echo "TEST_VLLM_COMMIT=$COMMIT_ID" >> "$GITHUB_OUTPUT"
+          echo "TEST_VLLM_COMMIT=$COMMIT_ID" >> "$GITHUB_ENV"
+          echo "Target commit ID for testing: $COMMIT_ID"
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           # Fetch full history for accurate commit comparison
-          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
           clean: true # Ensure a clean workspace before checkout
 
       - name: Setup Docker environment and build image
-        # Using a multi-line string for the Dockerfile is generally fine,
-        # but consider moving it to a separate file for better readability/maintainability
         run: |
           echo "Attempting to build Docker image..."
           # Ensure this image is accessible from GitHub Actions (e.g., public registry or authenticated private registry).
@@ -262,7 +430,79 @@ jobs:
           echo "Running HPU plugin test: ${{ matrix.test_function }}"
           EXITCODE=$?
           echo "Test script exited with code: $EXITCODE"
-  
+
+  calibration_tests:
+    needs: [pre_merge_hpu_test_build, hpu_unit_tests, discover_calibration_tests, discover_runner, retrieve_head_sha]
+    runs-on: ${{ needs.discover_runner.outputs.runner_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test_function: ${{ fromJson(needs.discover_calibration_tests.outputs.matrix) }}
+
+    steps:
+      - name: Run calibration test - ${{ matrix.test_function }}
+        run: |
+          echo "Running HPU calibration test: ${{ matrix.test_function }}"
+
+          EXITCODE=$?
+          echo "Test script exited with code: $EXITCODE"
+
+  calibration_arg_parsing_tests:
+    needs: [pre_merge_hpu_test_build, discover_runner, retrieve_head_sha]
+    runs-on: ${{ needs.discover_runner.outputs.runner_name }}
+    steps:
+      - name: Run calibration arg parsing tests
+        run: |
+          echo "Running calibration arg parsing tests"
+
+          EXITCODE=$?
+          echo "Test script exited with code: $EXITCODE"
+
+  # Build-test production Dockerfiles when they are modified
+  check_dockerfile_changes:
+    needs: [retrieve_head_sha]
+    if: inputs.is_merge_group != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      nixl_changed: ${{ steps.check.outputs.nixl_changed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
+          fetch-depth: 0
+      - name: Detect changed Dockerfiles
+        id: check
+        run: |
+          # Compare PR head against merge base to find changed files
+          CHANGED=$(git diff --name-only origin/${{ inputs.base_ref || github.event.pull_request.base.ref }}...HEAD -- '.cd/Dockerfile.ubuntu.pytorch.vllm.nixl.latest')
+          if [ -n "$CHANGED" ]; then
+            echo "nixl_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Nixl Dockerfile was modified"
+          else
+            echo "nixl_changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nixl Dockerfile was NOT modified"
+          fi
+
+  build_nixl_dockerfile:
+    needs: [check_dockerfile_changes, discover_runner, retrieve_head_sha]
+    if: needs.check_dockerfile_changes.outputs.nixl_changed == 'true'
+    runs-on: ${{ needs.discover_runner.outputs.runner_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.retrieve_head_sha.outputs.head_sha }}
+          clean: true
+      - name: Build nixl Dockerfile (validation only)
+        run: |
+          echo "Building .cd/Dockerfile.ubuntu.pytorch.vllm.nixl.latest to verify it builds correctly..."
+
+          echo "Nixl Dockerfile build succeeded."
+      - name: Cleanup test image
+        if: always()
+        run: docker rmi -f nixl-dockerfile-build-test || true
+
   pre_merge_hpu_test:
     needs: [hpu_unit_tests, e2e, hpu_perf_tests]
     # --- UPDATED: Run on the specific node ---
@@ -270,7 +510,7 @@ jobs:
     # This job is required to pass for pre-merge CI. By itself it does nothing, and will only pass if all jobs specified in "needs" list pass.
     steps:
       - name: Succeeded if all previous jobs passed
-        run: echo "All previous jobs passed." 
+        run: echo "All previous jobs passed."
   # This is a new job, at the same level as hpu-test-suite
   post-comment:
     name: Post PR Comment
@@ -282,7 +522,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Post Comment on Success
-        if: needs.pre_merge_hpu_test.result == 'success'
+        if: inputs.is_merge_group != 'true' && needs.pre_merge_hpu_test.result == 'success'
         uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ inputs.pr_number || github.event.pull_request.number }}

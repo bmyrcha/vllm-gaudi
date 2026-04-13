@@ -20,7 +20,13 @@ Bucketing is focused on three dimensions:
 - `query lenght`: The sequence length without context tokens.
 - `num blocks`: The context length counted in blocks.
 
-Bucketing ranges are generated based on 4 parameters - `min`, `step`, `max`, and `limit` - applied separately for the prompt and decode phases, as well as for batch size, query length, and context block dimensions. These parameters are logged and can be observed during vLLM startup:
+Bucketing ranges are generated separately for the prompt and decode phases, as well as for batch size, query length, and context block dimensions. The parameters depend on the selected strategy:
+
+- Exponential uses `min`, `step`, `max`, and `limit`.
+- Linear uses `min`, `step`, and `max`.
+- Padding-aware uses `min`, `step`, `max`, `pad_max`, and `pad_percent`.
+
+These parameters are logged and can be observed during vLLM startup:
 
 ```{.}
 INFO 07-07 19:27:37 [exponential.py:36] Prompt bucket config (min, step, max_warmup, limit) bs:[1, 1, 1, 1], seq:[128, 128, 1024, 11]
@@ -44,11 +50,14 @@ After the prefill stage, it will be executed as a `(4, 1, 512)` decode bucket, w
 
 Bucketing is transparent to the user – padding in the sequence length dimension is never returned, and padding in the batch dimension does not create new requests.
 
-There are three bucketing strategies: exponential (default), linear, and unified.
+There are three generated bucketing strategies, selected with `VLLM_BUCKETING_STRATEGY`: exponential (`exp`, default), linear (`lin`), and padding-aware (`pad`).
+
+!!! note
+    `VLLM_EXPONENTIAL_BUCKETING` is deprecated, but it is still honored for backward compatibility. If it is set, it overrides `VLLM_BUCKETING_STRATEGY`: `true` forces exponential bucketing and `false` forces linear bucketing. It cannot select padding-aware bucketing, so leave it unset when using `VLLM_BUCKETING_STRATEGY=pad`.
 
 ### Exponential Strategy
 
-The exponential strategy is the default warm-up mechanism. It is based on 4 parameters that are not configurable by the user:
+The exponential strategy is the default warm-up mechanism. Enable it with `VLLM_BUCKETING_STRATEGY=exp`. It is based on 4 parameters that are not configurable by the user:
 
 - `min`: The minimum value
 - `step`: The rounding value for bucket boundaries
@@ -70,7 +79,7 @@ This strategy creates more buckets with smaller values closer to `min`. As the v
 ### Linear Strategy
 
 !!! note
-    Starting from v1.22.0 Intel Gaudi Software release, Linear strategy is no longer the default warm-up mechanism.
+    Starting from v1.22.0 Intel Gaudi Software release, Linear strategy is no longer the default warm-up mechanism. Set `VLLM_BUCKETING_STRATEGY=lin` to use the linear strategy.
 
 The linear strategy is determined with 3 parameters: `min`, `step` and `max`, where:
 
@@ -95,42 +104,61 @@ These parameters can be configured separately by the user for the prompt and dec
     => buckets = ramp_up + stable => (128, 256, 384, 512)
     ```
 
-<!-- ### Unified Strategy
+### Padding-Aware Strategy
 
-The unified strategy is dedicated to Unified Attention. Its buckets are determined by the following non-configurable parameters:
+Set `VLLM_BUCKETING_STRATEGY=pad` to use the padding-aware strategy.
 
-- `query length`: The number of currently processed tokens, excluding context tokens.
-- `shared num blocks`: The context length measured in blocks. It includes only blocks that are shared between at least two block tables, in different requests, or blocks used by at least two tokens in the query.
-- `unique num blocks`: The context length measured in blocks. It includes only blocks that are not shared between block tables and are used by one token.
-- `is causal`: Indicates whether there is at least one prompt in the batch. Possible values are 0 or 1.
+Padding-aware bucketing extends the linear ramp-up with two additional controls:
 
-Unified bucketing prepares buckets for both prompt and decode as one, known as `unified cfg`. -->
+- `pad_max`: Maximum absolute padding tolerated before a denser bucket is kept.
+- `pad_percent`: Maximum relative padding tolerated before a denser bucket is kept.
 
-#### Alpha Version
+This strategy is useful when you want more direct control over the warm-up versus runtime-padding tradeoff. Lower `pad_percent` values produce more buckets and less runtime padding. Setting `pad_percent=0` approaches dense linear coverage, while larger values (up to 50) reduce warm-up cost and move closer to exponential spacing.
 
-Currently there are six points in ranges for query length, shared blocks and unique blocks. They are based on `max num seqs` and `max num batched tokens` values. The points are set at the whole, half, and one-quarter values of both parameters, resulting in a total of six points.
+The following examples use the configuration tuple `(min, step, max, pad_max, pad_percent)` and show how the generated warm-up buckets change as the padding limits change.
 
-The following example presents a possible distribution:
+Dense linear-like coverage:
 
 ```{.}
-batch size = 64, max num batched tokens = 4096
+config = (0, 8, 64, 64, 0)
+=> ramp_up = (0, 1, 2, 4, 8)
+=> stable = (16, 24, 32, 40, 48, 56, 64)
+=> buckets = (0, 1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64)
 ```
 
-![exponential bucketing distribution for 4096 max query length](../assets/graphs/unified_bucketing_example.png)
+With `pad_percent=0`, every linear bucket after the ramp-up is kept, so the result stays close to dense linear coverage.
 
-Additionally for context blocks, both shared and unique, a value of `0` is also included, resulting in the following bucketing:
+Ratio-limited spacing:
 
 ```{.}
-INFO 09-23 12:32:43 [common.py:100] Generated 375 unified buckets [query, shared_blocks, unique_blocks]: [(8, 0, 0, 1), (8, 0, 8, 0), ..., (2048, 256, 2890, 1), (2048, 256, 5781, 1)]
+config = (0, 8, 64, 64, 50)
+=> ramp_up = (0, 1, 2, 4, 8)
+=> stable = (16, 32, 64)
+=> buckets = (0, 1, 2, 4, 8, 16, 32, 64)
 ```
 
-The following example presents a setup where every bucket is logged separately in the warm-up phase:
+A larger `pad_percent` allows wider spacing, so several intermediate buckets are skipped and the result moves closer to exponential bucketing.
+
+Absolute pad cap:
 
 ```{.}
-(EngineCore_DP0 pid=805) INFO 09-23 12:32:50 [hpu_model_runner.py:3320] [Warmup][Unified CFG][2/375] query_len:2048 shared_blocks:256 unique_blocks:2890 (causal) free_mem:11.16 GiB
-(EngineCore_DP0 pid=805) INFO 09-23 12:32:53 [hpu_model_runner.py:3320] [Warmup][Unified CFG][3/375] query_len:2048 shared_blocks:256 unique_blocks:1445 (causal) free_mem:11.16 GiB
-(EngineCore_DP0 pid=805) INFO 09-23 12:32:56 [hpu_model_runner.py:3320] [Warmup][Unified CFG][4/375] query_len:2048 shared_blocks:256 unique_blocks:32 (causal) free_mem:11.16 GiB
+config = (0, 8, 64, 16, 50)
+=> ramp_up = (0, 1, 2, 4, 8)
+=> stable = (16, 32, 48, 64)
+=> buckets = (0, 1, 2, 4, 8, 16, 32, 48, 64)
 ```
+
+Reducing `pad_max` forces the strategy to keep extra intermediate buckets, even when `pad_percent` would otherwise allow a sparser range.
+
+No ramp-up phase:
+
+```{.}
+config = (16, 16, 128, 32, 25)
+=> stable = (16, 32, 48, 64, 80, 96, 128)
+=> buckets = (16, 32, 48, 64, 80, 96, 128)
+```
+
+When `min` already matches `step`, the strategy skips the ramp-up phase and starts directly with the stable region.
 
 ### Specifying Buckets in a File
 
@@ -160,6 +188,3 @@ You can define buckets in a file using three approaches.
 You can mix these three approaches in a single file, for example `([64, 128, 256], 1, range(512, 1024, 32))` is a valid configuration.
 
 Each bucket or a configuration has to be provided in a separate line. You can find a sample bucketing in [bucketing_file.txt](https://github.com/vllm-project/vllm-gaudi/blob/main/vllm_gaudi/extension/bucketing/bucketing_file.txt).
-
-<!-- !!! note
-    Currently, bucketing from a file is not supported for unified attention. -->

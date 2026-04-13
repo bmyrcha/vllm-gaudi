@@ -18,7 +18,6 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.sample.logits_processor import (BatchUpdateBuilder, LogitsProcessors)
-from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 
 from vllm_gaudi.utils import async_h2d_copy, async_h2d_update
 
@@ -77,7 +76,9 @@ class InputBatch:
         kernel_block_sizes: list[int],
         logitsprocs: Optional[LogitsProcessors] = None,
         is_spec_decode: bool = False,
+        is_pooling_model: bool = False,
     ):
+        self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -113,15 +114,13 @@ class InputBatch:
             self.num_computed_tokens_cpu_tensor.numpy()
 
         # Block table.
-        self.block_table = MultiGroupBlockTable(
-            max_num_reqs=max_num_reqs,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=max_num_batched_tokens,
-            pin_memory=pin_memory,
-            device=device,
-            block_sizes=block_sizes,
-            kernel_block_sizes=kernel_block_sizes,
-        )
+        self.block_table = MultiGroupBlockTable(max_num_reqs=max_num_reqs,
+                                                max_model_len=max_model_len,
+                                                max_num_batched_tokens=max_num_batched_tokens,
+                                                pin_memory=pin_memory,
+                                                device=device,
+                                                block_sizes=block_sizes,
+                                                kernel_block_sizes=kernel_block_sizes)
 
         # Sampling-related.
         self.temperature = torch.empty((max_num_reqs, ), dtype=torch.float32, device=device)
@@ -147,9 +146,6 @@ class InputBatch:
         self.min_p_cpu_tensor = torch.empty((max_num_reqs, ), dtype=torch.float32, device="cpu", pin_memory=pin_memory)
         self.min_p_cpu = self.min_p_cpu_tensor.numpy()
         self.min_p_reqs: set[str] = set()
-
-        # IDs of requests which do not support spec decoding
-        self.spec_decode_unsupported_reqs: set[str] = set()
 
         # Frequency penalty related data structures
         self.frequency_penalties = torch.empty((max_num_reqs, ), dtype=torch.float, device=device)
@@ -282,8 +278,6 @@ class InputBatch:
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
-            if (self.is_spec_decode and is_spec_decode_unsupported(sampling_params)):
-                self.spec_decode_unsupported_reqs.add(req_id)
             if sampling_params.sampling_type == SamplingType.GREEDY:
                 # Avoid later division by zero.
                 self.temperature_cpu[req_index] = -1.0
@@ -382,7 +376,6 @@ class InputBatch:
         self.top_p_reqs.discard(req_id)
         self.top_k_reqs.discard(req_id)
         self.min_p_reqs.discard(req_id)
-        self.spec_decode_unsupported_reqs.discard(req_id)
         self.frequency_penalties_reqs.discard(req_id)
         self.presence_penalties_reqs.discard(req_id)
         self.repetition_penalties_reqs.discard(req_id)
@@ -399,6 +392,11 @@ class InputBatch:
                 self.lora_id_to_request_ids.pop(lora_id)
                 self.lora_id_to_lora_request.pop(lora_id)
             self.request_lora_mapping[req_index] = 0
+
+        if self.is_pooling_model:
+            self.pooling_params.pop(req_id, None)
+            self.pooling_states.pop(req_id, None)
+            return req_index
 
         self.has_allowed_token_ids.discard(req_id)
         if self.allowed_token_ids_mask_cpu_tensor is not None:
@@ -458,6 +456,10 @@ class InputBatch:
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] =\
             self.request_lora_mapping[i2], self.request_lora_mapping[i1]
 
+        if self.is_pooling_model:
+            # Sampling and logits parameters don't apply to pooling models.
+            return
+
         if self.allowed_token_ids_mask_cpu_tensor is not None:
             self.allowed_token_ids_mask_cpu_tensor[i1], \
                 self.allowed_token_ids_mask_cpu_tensor[i2] =\
@@ -516,6 +518,11 @@ class InputBatch:
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[last_req_index]
 
+            if self.is_pooling_model:
+                last_req_index -= 1
+                # Sampling state not used by pooling models.
+                continue
+
             if self.allowed_token_ids_mask_cpu_tensor is not None:
                 self.allowed_token_ids_mask_cpu_tensor[empty_index] = self.allowed_token_ids_mask_cpu_tensor[
                     last_req_index]
@@ -565,8 +572,10 @@ class InputBatch:
             # The prompt tokens are used only for applying penalties during
             # the sampling process. Hence copy these tensors only when
             # there are requests which need penalties to be applied.
-            prompt_token_ids = self._make_prompt_token_ids_tensor()
+            prompt_token_ids_cpu = self._make_prompt_token_ids_cpu_tensor()
+            prompt_token_ids = prompt_token_ids_cpu.to(device=self.device, non_blocking=True)
         else:
+            prompt_token_ids_cpu = None
             prompt_token_ids = None
 
         allowed_token_ids_mask: Optional[torch.Tensor] = None
@@ -602,7 +611,7 @@ class InputBatch:
         """
         cache: Optional[torch.Tensor] = getattr(self, '_prompt_token_ids_cache', None)
         if cache is None and not self.no_penalties:
-            self._prompt_token_ids_cache = self._make_prompt_token_ids_tensor()
+            self._prompt_token_ids_cache = self._make_prompt_token_ids_cpu_tensor()
         return self._prompt_token_ids_cache
 
     def _invalidate_prompt_token_ids_cache(self):
@@ -631,7 +640,7 @@ class InputBatch:
                 # The prompt tokens are used only for applying penalties during
                 # the sampling process. Hence copy these tensors only when
                 # there are requests which need penalties to be applied.
-                prompt_token_ids = self._make_prompt_token_ids_tensor()[req_indices]
+                prompt_token_ids = self._make_prompt_token_ids_cpu_tensor()[req_indices]
         else:
             # Even with skip_copy=True, we need prompt_token_ids for penalties
             if not self.no_penalties:
@@ -692,15 +701,19 @@ class InputBatch:
     def get_pooling_metadata(self) -> PoolingMetadata:
         pooling_params = self.get_pooling_params()
         pooling_states = self.get_pooling_states()
+        prompt_token_ids_cpu = None
+        if any(p.requires_token_ids for p in pooling_params):
+            prompt_token_ids_cpu = self._make_prompt_token_ids_cpu_tensor()
 
         return PoolingMetadata(
             prompt_lens=torch.from_numpy(self.num_prompt_tokens[:self.num_reqs]).to(self.device),
             prompt_token_ids=self.sampling_metadata.prompt_token_ids,
+            prompt_token_ids_cpu=prompt_token_ids_cpu,
             pooling_params=pooling_params,
             pooling_states=pooling_states,
         )
 
-    def _make_prompt_token_ids_tensor(self) -> torch.Tensor:
+    def _make_prompt_token_ids_cpu_tensor(self) -> torch.Tensor:
         max_prompt_len = self.num_prompt_tokens[:self.num_reqs].max()
         prompt_token_ids_cpu_tensor = torch.empty(
             (self.num_reqs, max_prompt_len),
@@ -714,7 +727,7 @@ class InputBatch:
         # token_id of this value.
         for i in range(self.num_reqs):
             prompt_token_ids[i, self.num_prompt_tokens[i]:] = self.vocab_size
-        return prompt_token_ids_cpu_tensor.to(device=self.device, non_blocking=True)
+        return prompt_token_ids_cpu_tensor
 
     def make_lora_inputs(self,
                          num_scheduled_tokens: np.ndarray) -> tuple[tuple[int, ...], tuple[int, ...], set[LoRARequest]]:

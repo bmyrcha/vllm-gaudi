@@ -145,6 +145,10 @@ if __name__ == "__main__":
         "For single node calibration use the default multiprocessing backend. " \
         "For multi-node calibration use ray backend"
     )
+    parser.add_argument("--gpu-memory-utilization",
+                        type=float,
+                        default=0.9,
+                        help="GPU memory utilization for the model.")
 
     args = parser.parse_args()
     if not args.auto_process_dataset:
@@ -153,13 +157,13 @@ if __name__ == "__main__":
         model=args.model,
         dtype=torch.bfloat16,
         enforce_eager=args.enforce_eager,
-        quantization="fp8" if args.block_quant else "inc",
         max_num_seqs=args.batch_size,
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=args.max_model_len,
         trust_remote_code=True,
         distributed_executor_backend=args.distributed_executor_backend,
         enable_expert_parallel=args.expert_parallel,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
     sampling_params = vllm.SamplingParams(temperature=0.0, top_p=1, max_tokens=args.max_tokens)

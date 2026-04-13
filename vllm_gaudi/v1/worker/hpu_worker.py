@@ -2,6 +2,7 @@
 """A GPU worker class."""
 import contextlib
 import gc
+import math
 import os
 import queue
 from contextlib import contextmanager
@@ -17,8 +18,7 @@ from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaMemoryProfiler, format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import get_config
 
-import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (ensure_model_parallel_initialized, init_distributed_environment)
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -26,8 +26,8 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
 )
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, set_random_seed)
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec)
+from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.utils import is_fake_hpu
@@ -96,8 +96,10 @@ class HPUWorker(WorkerBase):
 
     def init_profiler(self):
         """Initialize the profiler."""
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+        torch_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
+        if torch_profiler_dir:
+            logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
+            torch_profiler_trace_dir = torch_profiler_dir
             logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_trace_dir)
             if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
                 fn = self.model_runner.profiler.full_trace_handler
@@ -148,11 +150,15 @@ class HPUWorker(WorkerBase):
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 
+    def reset_encoder_cache(self) -> None:
+        self.model_runner.reset_encoder_cache()
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
     def load_model(self) -> None:
-        self.model_runner.load_model()
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.load_model()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -178,28 +184,65 @@ class HPUWorker(WorkerBase):
         for layer_name, layer_spec in kv_cache_spec.items():
             if isinstance(layer_spec, FullAttentionSpec):
                 dtype = layer_spec.dtype
+                if dtype == torch.float8_e4m3fn and os.environ.get('QUANT_CONFIG', None) is not None and \
+                    os.environ.get('VLLM_DYNAMIC_KV_QUANT', None) is not None and not self.model_config.use_mla:
+                    create_dynamic_scales = True
+                else:
+                    create_dynamic_scales = False
 
-                # Use an empty tensor instead of `None`` to force Dynamo to pass
-                # it by reference, rather by specializing on the value ``None``.
-                hpu_k_cache = torch.tensor([], dtype=dtype, device='hpu')
-                hpu_v_cache = torch.tensor([], dtype=dtype, device='hpu')
-                hpu_k_scales = torch.tensor([], dtype=dtype, device='hpu')
-                hpu_v_scales = torch.tensor([], dtype=dtype, device='hpu')
+                # Create dummy KV cache tensors with proper shapes for profiling
+                num_blocks = 1  # Use single block for profiling
+                block_size = layer_spec.block_size
+                num_kv_heads = layer_spec.num_kv_heads
+                head_size = layer_spec.head_size
+
+                kv_cache_shape = self.model_runner.attn_backend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads,
+                                                                                   head_size)
+                kv_scales_shape = kv_cache_shape[:-1] + (1, )
+
+                hpu_k_cache = torch.zeros(kv_cache_shape, dtype=dtype, device='hpu')
+                hpu_v_cache = None if self.model_config.use_mla else torch.zeros(
+                    kv_cache_shape, dtype=dtype, device='hpu')
+
+                hpu_k_scales = torch.ones(kv_scales_shape, dtype=torch.bfloat16,
+                                          device='hpu') if create_dynamic_scales else None
+                if create_dynamic_scales:
+                    hpu_v_scales = (torch.ones(kv_scales_shape, dtype=torch.bfloat16, device='hpu'),
+                                    torch.ones([num_blocks, num_kv_heads, head_size],
+                                               dtype=torch.bfloat16,
+                                               device='hpu'))
+                else:
+                    hpu_v_scales = None
 
                 kv_caches[layer_name] = (hpu_k_cache, hpu_v_cache, hpu_k_scales, hpu_v_scales)
 
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
 
+            elif isinstance(layer_spec, MambaSpec):
+                dtype0 = layer_spec.dtypes[0]
+                dtype1 = layer_spec.dtypes[1]
+
+                # Use an empty tensor instead of `None`` to force Dynamo to pass
+                # it by reference, rather by specializing on the value ``None``.
+                hpu_ssm_cache = torch.tensor([], dtype=dtype0, device='hpu')
+                hpu_conv_cache = torch.tensor([], dtype=dtype1, device='hpu')
+                hpu_ssm_scales = torch.tensor([], dtype=dtype0, device='hpu')
+                hpu_conv_scales = torch.tensor([], dtype=dtype1, device='hpu')
+
+                kv_caches[layer_name] = (hpu_ssm_cache, hpu_conv_cache, hpu_ssm_scales, hpu_conv_scales)
+
+                single_kv_block_size_bytes += layer_spec.page_size_bytes
             else:
                 raise NotImplementedError
 
         runner_kv_caches: list[torch.Tensor] = []
         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
+
         if is_fake_hpu():
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
             return fake_hpu_cache_alloc
         with HabanaMemoryProfiler() as m:
-            self.model_runner.profile_run()
+            self.model_runner.profile_run(initialize_only=True)
             torch.hpu.synchronize()
         msg = ("Model profiling run "
                f"took {m.get_summary_string()}")
@@ -208,8 +251,12 @@ class HPUWorker(WorkerBase):
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
-        graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
-                              if not self.model_config.enforce_eager else 0)
+        try:
+            graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
+                                  if not self.model_config.enforce_eager else 0)
+        except ValueError:
+            graph_reserved_mem = 0.0 if self.model_config.enforce_eager else 0.1
+            logger.warning("Invalid VLLM_GRAPH_RESERVED_MEM value, using default %s", graph_reserved_mem)
         graph_headroom = 1 - graph_reserved_mem
         available_hpu_memory = free_hpu_memory * \
             self.cache_config.gpu_memory_utilization
@@ -228,8 +275,79 @@ class HPUWorker(WorkerBase):
                "reserved for usable KV cache")
 
         logger.info(msg)
+
+        # Clear the dummy KV cache to free up memory
+        kv_caches = {}
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        for layer_name in forward_context:
+            forward_context[layer_name].kv_cache = None
+        runner_kv_caches = []
         gc.collect()
-        return cache_size_bytes - dummy_block_headroom
+        available = cache_size_bytes - dummy_block_headroom
+
+        # For hybrid models (attention + recurrent layers), the GPU
+        # backend shares a single raw buffer across spec types via
+        # as_strided, but HPU allocates separate tensors per spec
+        # (torch.compile can't handle as_strided mixed-dtype views).
+        # Reduce reported memory so the scheduler computes fewer
+        # num_blocks that fit the HPU separate-allocation model.
+        has_attn = any(isinstance(s, FullAttentionSpec) for s in kv_cache_spec.values())
+        has_gdn = any(
+            isinstance(s, MambaSpec) and s.mamba_type in ("gdn_attention", "linear_attention")
+            for s in kv_cache_spec.values())
+        has_standard_mamba = any(
+            isinstance(s, MambaSpec) and s.mamba_type not in ("gdn_attention", "linear_attention")
+            for s in kv_cache_spec.values())
+        compact_gdn = os.environ.get("VLLM_COMPACT_GDN", "0").strip().lower() in ("1", "true")
+        if has_attn and has_gdn and not compact_gdn:
+            # When compact GDN is OFF, GDN state scales with num_blocks
+            # just like ATN.  GPU shares one raw buffer via as_strided,
+            # but HPU allocates separate tensors per spec type, so the
+            # total per-block cost is real_attn + real_mamba (not
+            # max(real_attn, real_mamba)).  Reduce reported memory so
+            # the scheduler computes fewer num_blocks that fit.
+            # When compact GDN is ON, GDN state is a small fixed
+            # allocation (max_reqs * num_groups + 2), independent of
+            # num_blocks, so no adjustment is needed.
+            padded_page = next(iter(kv_cache_spec.values())).page_size_bytes
+            real_attn = next(s.real_page_size_bytes for s in kv_cache_spec.values() if isinstance(s, FullAttentionSpec))
+            real_mamba = next(
+                sum(math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(s.shapes, s.dtypes))
+                for s in kv_cache_spec.values()
+                if isinstance(s, MambaSpec) and s.mamba_type in ("gdn_attention", "linear_attention"))
+            total_real = real_attn + real_mamba
+            if total_real > padded_page:
+                factor = padded_page / total_real
+                adjusted = int(available * factor)
+                logger.info(
+                    "HPU hybrid cache: reducing available KV cache "
+                    "memory by %.1f%% (factor=%.3f) for separate "
+                    "per-spec allocations (padded_page=%s, "
+                    "real_attn=%s, real_mamba=%s).", (1 - factor) * 100, factor, format_bytes(padded_page),
+                    format_bytes(real_attn), format_bytes(real_mamba))
+                available = adjusted
+
+        if has_attn and has_standard_mamba:
+            # Standard Mamba2 + ATN hybrids (e.g. Granite): the
+            # naive_mamba_cache_sharing path allocates independent
+            # tensors per layer type, so the real per-block cost is
+            # attn_page + mamba_state (not max(attn, mamba)).
+            attn_page_size = next(s.page_size_bytes for s in kv_cache_spec.values() if isinstance(s, FullAttentionSpec))
+            mamba_state_per_block = next(
+                sum(math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(s.shapes, s.dtypes))
+                for s in kv_cache_spec.values()
+                if isinstance(s, MambaSpec) and s.mamba_type not in ("gdn_attention", "linear_attention"))
+            if attn_page_size > 0:
+                ratio = attn_page_size / (attn_page_size + mamba_state_per_block)
+                adjusted = int(available * ratio)
+                logger.info(
+                    "Hybrid model (standard Mamba2 + ATN): adjusted "
+                    "usable KV cache from %s to %s (attn_page=%d, "
+                    "mamba_state=%d, ratio=%.3f)", format_bytes(available), format_bytes(adjusted), attn_page_size,
+                    mamba_state_per_block, ratio)
+                available = adjusted
+
+        return available
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -238,29 +356,46 @@ class HPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
+        # Init kv cache connector here, because it requires
+        # `kv_cache_config`.
+        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
+        # because `initialize_kv_cache` will inject kv cache groups not
+        # related to kv cache connector (e.g. kv cache sharing layers).
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+
         with HabanaMemoryProfiler() as m:
             self.kv_cache_config = kv_cache_config
             self.model_runner.initialize_kv_cache(kv_cache_config)
             torch.hpu.synchronize()
-        msg = (f"Usable num_blocks: {kv_cache_config.num_blocks}, "
-               f"actual allocated num_blocks: "
-               f"{self.model_runner.kv_caches[0][0].shape[0]} "
-               f"(_PAD_BLOCK_ID={self.model_runner._PAD_BLOCK_ID}, "
-               f"_PAD_SLOT_ID={self.model_runner._PAD_SLOT_ID})")
-        logger.info(msg)
+        if len(self.model_runner.kv_caches) > 0:
+            # Find the first ATN layer's tensor shape for a meaningful
+            # block count (compact GDN layers have a much smaller dim-0).
+            alloc_blocks = None
+            for kv in self.model_runner.kv_caches:
+                t = kv[0] if not isinstance(kv[0], tuple) else kv[0][0]
+                dim0 = t.shape[0]
+                if alloc_blocks is None or dim0 > alloc_blocks:
+                    alloc_blocks = dim0
+            msg = (f"Usable num_blocks: {kv_cache_config.num_blocks}, "
+                   f"actual allocated num_blocks (max across layers): "
+                   f"{alloc_blocks} "
+                   f"(_PAD_BLOCK_ID={self.model_runner._PAD_BLOCK_ID}, "
+                   f"_PAD_SLOT_ID={self.model_runner._PAD_SLOT_ID})")
+            logger.info(msg)
         msg = ("Initializing cache engine "
                f"took {m.get_summary_string()}")
         logger.info(msg)
         self.compile_or_warm_up_model()
 
-    def compile_or_warm_up_model(self) -> None:
-        # Don't run the warmup if in eager or if the model is already warmed up
-        if not self.model_config.enforce_eager \
-            and not getattr(self.model_runner, 'graphed_buckets', None):
+    def compile_or_warm_up_model(self) -> float:
+        # Don't run the warmup if the model is already warmed up
+        if not getattr(self.model_runner, 'graphed_buckets', None):
             self.model_runner.warmup_model()
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+        return self.vllm_config.compilation_config.compilation_time
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
@@ -357,7 +492,7 @@ class HPUWorker(WorkerBase):
             logger.warning("KV cache has not been initialized yet, skipping discarding it")
         else:
             with HabanaMemoryProfiler() as m:
-                self.model_runner.defragmenter.cache_utils.kv_caches = None
+                self.model_runner.defragmenter = None
                 self.model_runner.kv_caches = []
                 forward_context = self.vllm_config.compilation_config.static_forward_context
                 for layer_name in forward_context:
@@ -371,7 +506,7 @@ class HPUWorker(WorkerBase):
     def wake_up(self, tags: list[str] | None = None) -> None:
         """Wake up the worker from sleep mode.
         It can move the model back to HPU and/or reinitialize KV cache.
-        
+
         Args:
             tags: Optional list of tags (kept for interface compatibility)
         """
@@ -405,8 +540,8 @@ class HPUWorker(WorkerBase):
             else:
                 with HabanaMemoryProfiler() as m:
                     self.model_runner.initialize_kv_cache(self.kv_cache_config)
-                    self.model_runner.defragmenter = OnlineDefragmenter()
-                    self.model_runner.defragmenter.initialize(self.model_runner.kv_caches, self.model_runner.block_size)
+                    self.model_runner.defragmenter = OnlineDefragmenter(self.model_runner.kv_caches,
+                                                                        self.model_runner.block_size)
                     gc.collect()
                     torch.hpu.synchronize()
                 msg = f"Waking up KV cache, reinitializing it took {m.get_summary_string()}"
@@ -428,8 +563,6 @@ def init_worker_distributed_environment(
     torch.distributed.all_reduce(dummy_tensor_hpu)
     assert dummy_tensor_hpu.item() == parallel_config.world_size * parallel_config.data_parallel_size
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size, parallel_config.pipeline_parallel_size)
-
-    ensure_kv_transfer_initialized(vllm_config)
 
 
 @contextmanager
