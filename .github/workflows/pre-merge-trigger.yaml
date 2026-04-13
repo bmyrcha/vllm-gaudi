@@ -8,5 +8,5 @@ on:
       - releases/**
 jobs:
   execute_pre_merge:
-    uses: vllm-project/vllm-gaudi/.github/workflows/pre-merge.yml@{{ github.event.pull_request.base.ref }}
+    uses: bmyrcha/vllm-gaudi/.github/workflows/pre-merge.yml@{{github.event.pull_request.base.ref}}
     secrets: inherit
