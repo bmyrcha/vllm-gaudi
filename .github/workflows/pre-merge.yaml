@@ -170,8 +170,6 @@ jobs:
     runs-on: self-hosted
     permissions:
       contents: read # Required to checkout code and read history
-    outputs:
-      target_commit: ${{ steps.checkout_vllm_upstream.outputs.TEST_VLLM_COMMIT }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -281,5 +279,4 @@ jobs:
           issue-number: ${{ github.event.pull_request.number }}
           body: |
             ### ✅ CI Passed
-            All checks passed successfully against the following vllm commit:
-            **`${{ needs.pre_merge_hpu_test_build.outputs.target_commit }}`**
+            All checks passed successfully
