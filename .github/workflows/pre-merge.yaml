@@ -8,8 +8,10 @@ on:
       pr_number:  { description: 'PR number',                     required: false, type: string }
       head_sha:   { description: 'PR head commit SHA',            required: false, type: string }
       base_ref:   { description: 'PR target branch',              required: false, type: string }
-      is_draft:   { description: 'Draft PR (true/false)',         required: false, type: string, default: 'false' }
-      skip_tests: { description: 'Skip Gaudi tests (true/false)', required: false, type: string, default: 'false' }
+      pr_title:       { description: 'PR title',                          required: false, type: string }
+      is_draft:       { description: 'Draft PR (true/false)',             required: false, type: string, default: 'false' }
+      skip_tests:     { description: 'Skip Gaudi tests (true/false)',     required: false, type: string, default: 'false' }
+      is_merge_group: { description: 'Triggered from merge queue (true/false)', required: false, type: string, default: 'false' }
 
 permissions:
   pull-requests: write
@@ -48,6 +50,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [[ "${{ inputs.is_merge_group }}" == "true" ]]; then
+            echo "Merge group event detected. Skipping gatekeeper checks."
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           BLOCKING_REASON=""
 
           # --- New check to see if the PR is behind the base branch ---
@@ -103,7 +111,7 @@ jobs:
             > ${{ steps.check_conditions.outputs.reason }}
 
       - name: Fail the job to block downstream CI
-        if: steps.check_conditions.outputs.run_ci == 'false'
+        if: inputs.is_merge_group != 'true' && steps.check_conditions.outputs.run_ci == 'false'
         run: |
           echo "Failing this job to prevent the main CI from running."
           exit 1
