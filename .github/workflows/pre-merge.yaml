@@ -218,8 +218,6 @@ jobs:
       - name: Run pytest in tests/unit_tests
         run: |
           echo "Running HPU plugin v1 unit tests"
-          EXITCODE=$?
-          echo "Test script exited with code: $EXITCODE"
   hpu_pd_tests:
     needs: [pre_merge_hpu_test_build, hpu_unit_tests]
     # --- UPDATED: Run on the specific node ---
@@ -228,8 +226,6 @@ jobs:
       - name: Run test scripts
         run: |
           echo "Running HPU plugin v1 nixl pd tests"
-          EXITCODE=$?
-          echo "Test script exited with code: $EXITCODE"
   hpu_perf_tests:
     needs: [pre_merge_hpu_test_build, hpu_unit_tests]
     # --- UPDATED: Run on the specific node ---
@@ -237,9 +233,7 @@ jobs:
     steps:
       - name: Run test scripts
         run: |
-          echo "Running HPU plugin v1 perf tests"          
-          EXITCODE=$?
-          echo "Test script exited with code: $EXITCODE"
+          echo "Running HPU plugin v1 perf tests"
   hpu_dp_tests:
     needs: [pre_merge_hpu_test_build, hpu_unit_tests]
     # --- UPDATED: Run on the specific node ---
@@ -248,8 +242,6 @@ jobs:
       - name: Run test scripts
         run: |
           echo "Running HPU plugin v1 dp tests"
-          EXITCODE=$?
-          echo "Test script exited with code: $EXITCODE"
   e2e:
     needs: [pre_merge_hpu_test_build, hpu_unit_tests, discover_tests]
     # --- UPDATED: Run on the specific node ---
@@ -262,14 +254,8 @@ jobs:
 
     steps:
       - name: Run test suite - ${{ matrix.test_function }}
-        run: |
-          EXITCODE=1
-          CONTAINER_NAME="hpu-plugin-test-e2e-${{ inputs.head_sha || github.event.pull_request.head.sha }}-${{ matrix.test_function }}"
-          echo "Container: ${CONTAINER_NAME}"
-
+        run: |          
           echo "Running HPU plugin test: ${{ matrix.test_function }}"
-          EXITCODE=$?
-          echo "Test script exited with code: $EXITCODE"
   
   pre_merge_hpu_test:
     needs: [hpu_unit_tests, e2e, hpu_perf_tests]
