@@ -231,8 +231,8 @@ run_compressed_w4a16_moe_gidx_load_generate_test() {
 # Llama-3.3-70B-Instruct-FP8-dynamic + INC dynamic quant
 run_llama3_70b_inc_dynamic_quant_load_generate_test() {
     echo "➡️ Testing Llama-3.3-70B-Instruct-FP8-dynamic + inc dynamic quant in torch.compile mode ..."
-    QUANT_CONFIG="${VLLM_GAUDI_PREFIX}/tests/models/language/generation/inc_maxabs_dynamic_quant.json" \
-    HABANA_VISIBLE_DEVICES=all RUNTIME_SCALE_PATCHING=0 VLLM_SKIP_WARMUP=true PT_HPU_LAZY_MODE=0 \
+    QUANT_CONFIG="${VLLM_GAUDI_PREFIX}/calibration/quantization_config/maxabs_quant_dynamic_quantization_weight_pcs_pow2.json" \
+    HABANA_VISIBLE_DEVICES=all RUNTIME_SCALE_PATCHING=0 VLLM_SKIP_WARMUP=true PT_HPU_LAZY_MODE=0 VLLM_DYNAMIC_KV_QUANT=1 \
     python -u "${VLLM_GAUDI_PREFIX}/tests/full_tests/generate.py" --model RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic --max-model-len 2048
     echo "✅ Test with Llama-3.3-70B-Instruct-FP8-dynamic + inc dynamic quant in torch.compile mode passed."
 }
@@ -296,8 +296,8 @@ run_deepseek_ocr_vl_test() {
 
 run_llama3_70b_inc_dynamic_quant_test() {
     echo "➡️ Testing Llama-3.3-70B-Instruct-FP8-dynamic + inc dynamic quant in torch.compile mode ..."
-    QUANT_CONFIG="${VLLM_GAUDI_PREFIX}/tests/models/language/generation/inc_maxabs_dynamic_quant.json" \
-    HABANA_VISIBLE_DEVICES=all RUNTIME_SCALE_PATCHING=0 VLLM_SKIP_WARMUP=true PT_HPU_LAZY_MODE=0 \
+    QUANT_CONFIG="${VLLM_GAUDI_PREFIX}/calibration/quantization_config/maxabs_quant_dynamic_quantization_weight_pcs_pow2.json" \
+    HABANA_VISIBLE_DEVICES=all RUNTIME_SCALE_PATCHING=0 VLLM_SKIP_WARMUP=true PT_HPU_LAZY_MODE=0 VLLM_DYNAMIC_KV_QUANT=1 \
     python -u "${VLLM_GAUDI_PREFIX}/tests/full_tests/generate.py" --model RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic --max-model-len 2048
     echo "✅ Test with Llama-3.3-70B-Instruct-FP8-dynamic + inc dynamic quant in torch.compile mode passed."
 }
@@ -448,6 +448,13 @@ run_sleep_mode_test() {
     echo "✅ Test with sleep mode passed."
 }
 
+# online model swap
+run_online_model_swap_test() {
+    echo "Testing basic model swap functionality"
+    HABANA_VISIBLE_DEVICES=all VLLM_SKIP_WARMUP=true PT_HPU_LAZY_MODE=0 python -u "${VLLM_GAUDI_PREFIX}/tests/full_tests/online_model_swap.py"
+    echo "✅ Test with online model swap passed."
+}
+
 # Structured output
 run_structured_output_test() {
     echo "➡️ Testing structured output..."
@@ -506,6 +513,7 @@ launch_all_tests() {
     run_cpu_offloading_test
     run_offloading_connector_test
     run_sleep_mode_test
+    run_online_model_swap_test
     run_structured_output_test
     echo "🎉 All test suites passed successfully!"
 }
