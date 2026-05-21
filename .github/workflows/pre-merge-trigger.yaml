@@ -17,7 +17,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+     runs-on: ubuntu-latest
+     environment: pre-merge-approval
+     steps:
+       - run: echo "Approved"
   execute_pre_merge:
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 720
     permissions:
