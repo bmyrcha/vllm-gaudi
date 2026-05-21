@@ -25,6 +25,7 @@ jobs:
   execute_pre_merge:
     needs: gate
     runs-on: ubuntu-latest
+    environment: pre-merge-approval
     timeout-minutes: 720
     permissions:
       actions: write       # dispatch workflows, read run status, cancel orphaned runs
